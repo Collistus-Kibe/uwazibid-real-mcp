@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "uwazibid-custom-mcp": {
+      "command": "python",
+      "args": ["mcp_servers/uwazibid_server.py"],
+      "description": "Custom FastMCP server for real PDF parsing, World Bank/AfDB screening, and PPRA MPI econometric benchmarking"
+    },
+    "sqlite": {
+      "command": "mcp-server-sqlite",
+      "args": ["--db-path", "data/uwazibid_real.db"],
+      "description": "External reference MCP SQLite server for independent database verification"
+    }
+  }
+}
