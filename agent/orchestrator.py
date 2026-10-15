@@ -189,29 +189,31 @@ def synthesize_with_llm(session_id: str, bidder_name: str, pdf_rep: dict, sanc_r
     gemma_model = os.getenv("GEMMA_OPEN_WEIGHTS_MODEL", "gemma-4-31b-it").strip()
 
     for idx, key in enumerate(gemini_keys, start=1):
-        # 1. Open-Weights Gemma via Google OpenAI-compatible endpoint
-        candidates.append((
-            "gemini_gemma",
-            "https://generativelanguage.googleapis.com/v1beta/openai/",
-            key,
-            gemma_model,
-            f"Open-Weights Gemma (Key #{idx}: {gemma_model})"
-        ))
-        # Also try gemma-4-26b-a4b-it as secondary open-weights model
-        candidates.append((
-            "gemini_gemma_alt",
-            "https://generativelanguage.googleapis.com/v1beta/openai/",
-            key,
-            "gemma-4-26b-a4b-it",
-            f"Open-Weights Gemma (Key #{idx}: gemma-4-26b-a4b-it)"
-        ))
-        # 2. Gemini 2.5 Flash via Google OpenAI-compatible endpoint
+        # 1. Primary fast & concise synthesizer: Gemini 2.5 Flash
         candidates.append((
             "gemini_flash",
             "https://generativelanguage.googleapis.com/v1beta/openai/",
             key,
             gemini_model,
-            f"Google Gemini (Key #{idx}: {gemini_model})"
+            f"Google Gemini (Key #{idx}: {gemini_model})",
+            800
+        ))
+        # 2. Open-Weights Gemma via Google OpenAI-compatible endpoint (needs higher token limit for internal thoughts)
+        candidates.append((
+            "gemini_gemma",
+            "https://generativelanguage.googleapis.com/v1beta/openai/",
+            key,
+            gemma_model,
+            f"Open-Weights Gemma (Key #{idx}: {gemma_model})",
+            2048
+        ))
+        candidates.append((
+            "gemini_gemma_alt",
+            "https://generativelanguage.googleapis.com/v1beta/openai/",
+            key,
+            "gemma-4-26b-a4b-it",
+            f"Open-Weights Gemma (Key #{idx}: gemma-4-26b-a4b-it)",
+            2048
         ))
 
     # OpenAI Keys
@@ -229,7 +231,8 @@ def synthesize_with_llm(session_id: str, bidder_name: str, pdf_rep: dict, sanc_r
             "https://api.openai.com/v1",
             key,
             openai_model,
-            f"OpenAI (Key #{idx}: {openai_model})"
+            f"OpenAI (Key #{idx}: {openai_model})",
+            800
         ))
 
     # Groq fallback
@@ -241,7 +244,8 @@ def synthesize_with_llm(session_id: str, bidder_name: str, pdf_rep: dict, sanc_r
             "https://api.groq.com/openai/v1",
             groq_key,
             groq_model,
-            f"Open-Weights Groq ({groq_model})"
+            f"Open-Weights Groq ({groq_model})",
+            800
         ))
 
     # Local Ollama fallback
@@ -252,13 +256,22 @@ def synthesize_with_llm(session_id: str, bidder_name: str, pdf_rep: dict, sanc_r
             "http://localhost:11434/v1",
             "ollama",
             ollama_model,
-            f"Local Ollama ({ollama_model})"
+            f"Local Ollama ({ollama_model})",
+            800
         ))
 
-    # Attempt execution across candidate chain
-    for kind, base_url, api_key, model, tag in candidates:
+    # Build the authoritative human-readable statutory evaluation brief
+    bullet_1 = f"**Document Chain-of-Custody (PPADA Sec 55/79):** File `{pdf_rep.get('filename')}` validated with SHA-256 fingerprint `{pdf_rep.get('document_sha256', '')[:20]}...` across {pdf_rep.get('page_count')} page(s). KRA PINs detected: `{', '.join(pdf_rep.get('extracted_kra_pins', [])) if pdf_rep.get('extracted_kra_pins') else 'None Detected'}`. Status: {'Compliant with Mandatory Requirements' if pdf_rep.get('preliminary_compliant') else 'FAILED Mandatory Statutory Checklist'}."
+    bullet_2 = f"**Multilateral Debarment Screening (PPADA Sec 41):** Cross-checked `{sanc_rep.get('queried_name')}` against **{sanc_rep.get('total_watchlist_records_scanned', 0):,} real World Bank & AfDB debarred entities**. Result: {'🚨 SANCTIONED/DEBARRED ENTITY MATCH FOUND' if sanc_rep.get('is_flagged') else '✅ Clean (Zero Watchlist Matches)'}."
+    bullet_3 = f"**PPRA Market Price Benchmarking (PPADA Sec 54):** Item `{price_rep.get('item_code')}` quoted at `{price_rep.get('quoted_original')}` (normalized KES `{price_rep.get('normalized_quoted_kes', 0):,.2f}`) against official PPRA National Geometric Mean of **KES `{price_rep.get('ppra_national_geometric_mean_kes', 0):,.2f}`** ({price_rep.get('deviation_from_geometric_mean_pct', 0)}% deviation). Corridor Assessment: {price_rep.get('statutory_assessment', 'Within Bounds')}."
+    bullet_4 = f"**Statutory Recommendation & HITL Gate (PPADA Sec 46):** Evaluation Committee Chair must review the attached audit findings. Recommended non-binding posture: `{short_rec}`."
+
+    statutory_brief = f"- {bullet_1}\n- {bullet_2}\n- {bullet_3}\n- {bullet_4}"
+
+    # Attempt execution across candidate chain to generate an AI Executive Summary
+    for kind, base_url, api_key, model, tag, max_toks in candidates:
         try:
-            client = OpenAI(base_url=base_url, api_key=api_key)
+            client = OpenAI(base_url=base_url, api_key=api_key, timeout=12.0)
             completion = client.chat.completions.create(
                 model=model,
                 messages=[
@@ -266,33 +279,39 @@ def synthesize_with_llm(session_id: str, bidder_name: str, pdf_rep: dict, sanc_r
                     {"role": "user", "content": user_msg}
                 ],
                 temperature=0.1,
-                max_tokens=600
+                max_tokens=800
             )
-            memo_body = completion.choices[0].message.content or ""
-            # Strip internal <thought> tags if returned by reasoning models
+            raw_text = completion.choices[0].message.content or ""
             import re
-            memo_body = re.sub(r"<thought>.*?</thought>", "", memo_body, flags=re.DOTALL).strip()
-            memo = f"**[Synthesized by {tag}]**\n\n{memo_body}"
-            log_audit_event(
-                session_id, "LLM_EVIDENCE_SYNTHESIS", model, "chat.completions",
-                {"bidder": bidder_name, "provider_tag": tag},
-                memo[:300], ["PPADA 2015", "PPRA MPI", tag]
-            )
-            return memo, short_rec
+            clean_body = re.sub(r"<thought>.*?</thought>", "", raw_text, flags=re.DOTALL).strip()
+            if not clean_body or len(clean_body) < 50:
+                thought_match = re.search(r"<thought>(.*)", raw_text, flags=re.DOTALL)
+                clean_body = thought_match.group(1).replace("</thought>", "").strip() if thought_match else raw_text.strip()
+
+            if clean_body and len(clean_body) > 40:
+                memo = (
+                    f"### 📋 Tender Evaluation Committee Statutory Brief\n\n"
+                    f"{statutory_brief}\n\n"
+                    f"---\n"
+                    f"**🤖 AI Synthesized Commentary ({tag}):**\n\n"
+                    f"{clean_body}"
+                )
+                log_audit_event(
+                    session_id, "LLM_EVIDENCE_SYNTHESIS", model, "chat.completions",
+                    {"bidder": bidder_name, "provider_tag": tag},
+                    memo[:300], ["PPADA 2015", "PPRA MPI", tag]
+                )
+                return memo, short_rec
         except Exception as err:
-            print(f"[Orchestrator LLM Rotation] Warning: Call failed with {tag}: {err}")
             continue
 
-    # Deterministic fallback when no API keys are provided or all endpoints are unreachable
-    fallback = (
-        f"**[Deterministic Statutory Synthesis — `{short_rec}`]**\n\n"
-        f"- **Document Chain-of-Custody:** Parsed `{pdf_rep.get('filename')}` (`SHA-256: {pdf_rep.get('document_sha256', '')[:20]}...`, {pdf_rep.get('page_count')} pages). Extracted KRA PINs: `{pdf_rep.get('extracted_kra_pins')}`.\n"
-        f"- **Debarment & Sanctions Screening:** Cross-checked `{sanc_rep.get('queried_name')}` against **{sanc_rep.get('total_watchlist_records_scanned', 0):,} real World Bank & AfDB debarred entities**. Flagged hits: `{len(sanc_rep.get('matches', []))}`.\n"
-        f"- **PPRA Market Price Index Benchmark:** Quoted `{price_rep.get('quoted_original')}` (KES `{price_rep.get('normalized_quoted_kes', 0):,.2f}`) vs PPRA National Geometric Mean of **KES `{price_rep.get('ppra_national_geometric_mean_kes', 0):,.2f}`** (`{price_rep.get('deviation_from_geometric_mean_pct', 0)}%` deviation).\n"
-        f"- **Human-in-the-Loop Mandate:** Committee Officer must review and sign off under PPADA Section 46 below."
+    # Clean fallback if all external models are offline
+    memo = (
+        f"### 📋 Tender Evaluation Committee Statutory Brief\n\n"
+        f"{statutory_brief}"
     )
     log_audit_event(
         session_id, "DETERMINISTIC_SYNTHESIS_FALLBACK", "rules-engine", "statutory_synthesizer",
-        {"bidder": bidder_name}, fallback[:300], ["PPADA 2015 Sec 46", "PPRA MPI"]
+        {"bidder": bidder_name}, memo[:300], ["PPADA 2015 Sec 46", "PPRA MPI"]
     )
-    return fallback, short_rec
+    return memo, short_rec
